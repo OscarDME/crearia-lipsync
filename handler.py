@@ -35,13 +35,12 @@ from musetalk.utils.audio_processor import AudioProcessor  # noqa: E402
 from musetalk.utils.utils import load_all_model  # noqa: E402
 
 FPS = 25
-LOTE = int(os.environ.get("LOTE", "48"))
+LOTE = int(os.environ.get("LOTE", "32"))
 HILOS = int(os.environ.get("HILOS", str(max(2, min(16, (os.cpu_count() or 4))))))
 CACHE = os.environ.get("CACHE_AVATARES", "/tmp/avatares")
 os.makedirs(CACHE, exist_ok=True)
 
 t_carga = time.time()
-torch.backends.cudnn.benchmark = True
 device = torch.device("cuda")
 vae, unet, pe = load_all_model(
     unet_model_path="models/musetalkV15/unet.pth",
@@ -56,6 +55,11 @@ unet.model = unet.model.half().to(device)
 audio_processor = AudioProcessor(feature_extractor_path="models/whisper")
 whisper = WhisperModel.from_pretrained("models/whisper").to(device=device, dtype=torch.float16).eval()
 whisper.requires_grad_(False)
+# Calentamiento: la primera llamada de librosa/whisper es lenta; se paga una vez al arrancar la máquina.
+subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", "2", "/tmp/silencio.wav"], check=True)
+with torch.no_grad():
+    _f, _l = audio_processor.get_audio_feature("/tmp/silencio.wav", weight_dtype=torch.float16)
+    audio_processor.get_whisper_chunk(_f, device, torch.float16, whisper, _l, fps=FPS)
 SEG_CARGA = round(time.time() - t_carga, 1)
 print(f"modelos cargados en {SEG_CARGA}s", flush=True)
 
@@ -135,15 +139,20 @@ def cargar_avatar(avatar, base, t):
 
     a = os.path.join(d, avatar)
     x = time.time()
-    # Los cuadros del clip van a memoria (solo la ida; la vuelta se lee al revés). Sin escribir a disco.
-    cap = cv2.VideoCapture(f"{d}/clip.mp4")
+    # Los cuadros del clip van a memoria con ffmpeg en todos los núcleos (solo la ida; la vuelta se lee al revés).
+    sonda = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                            "-of", "csv=p=0", f"{d}/clip.mp4"], capture_output=True, text=True, check=True)
+    ancho, alto = [int(v) for v in sonda.stdout.strip().split(",")[:2]]
+    tam = ancho * alto * 3
+    dec = subprocess.Popen(["ffmpeg", "-v", "error", "-threads", "0", "-i", f"{d}/clip.mp4", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+                           stdout=subprocess.PIPE, bufsize=tam * 4)
     cuadros = []
     while True:
-        ok, f = cap.read()
-        if not ok:
+        b = dec.stdout.read(tam)
+        if len(b) < tam:
             break
-        cuadros.append(f)
-    cap.release()
+        cuadros.append(np.frombuffer(b, np.uint8).reshape(alto, ancho, 3))
+    dec.wait()
     if not cuadros:
         raise RuntimeError("no se pudo leer el clip")
     n = len(cuadros)
@@ -215,7 +224,9 @@ def handler(job):
         audio = f"{trabajo}/audio"
         _bajar(e["audio_url"], audio)
         t["audio_bajar_s"] = round(time.time() - t1, 1)
-        feats, largo = audio_processor.get_audio_feature(audio, weight_dtype=torch.float16)
+        audio16 = f"{trabajo}/audio16.wav"
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", audio, "-ac", "1", "-ar", "16000", audio16], check=True)
+        feats, largo = audio_processor.get_audio_feature(audio16, weight_dtype=torch.float16)
         trozos = audio_processor.get_whisper_chunk(feats, device, torch.float16, whisper, largo, fps=FPS,
                                                    audio_padding_length_left=2, audio_padding_length_right=2)
         total = len(trozos)
