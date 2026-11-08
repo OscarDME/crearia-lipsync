@@ -69,10 +69,10 @@ def _codificador():
     prueba = ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=1080x1920:d=0.2", "-c:v", "h264_nvenc", "-f", "null", "-"]
     try:
         if subprocess.run(prueba, capture_output=True, timeout=30).returncode == 0:
-            return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "21", "-b:v", "0"]
+            return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "24", "-b:v", "5M", "-maxrate", "7M", "-bufsize", "14M"]
     except Exception:
         pass
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-maxrate", "7M", "-bufsize", "14M"]
 
 
 CODIFICADOR = _codificador()
