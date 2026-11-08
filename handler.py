@@ -35,12 +35,13 @@ from musetalk.utils.audio_processor import AudioProcessor  # noqa: E402
 from musetalk.utils.utils import load_all_model  # noqa: E402
 
 FPS = 25
-LOTE = int(os.environ.get("LOTE", "32"))
+LOTE = int(os.environ.get("LOTE", "48"))
 HILOS = int(os.environ.get("HILOS", str(max(2, min(16, (os.cpu_count() or 4))))))
 CACHE = os.environ.get("CACHE_AVATARES", "/tmp/avatares")
 os.makedirs(CACHE, exist_ok=True)
 
 t_carga = time.time()
+torch.backends.cudnn.benchmark = True
 device = torch.device("cuda")
 vae, unet, pe = load_all_model(
     unet_model_path="models/musetalkV15/unet.pth",
@@ -84,66 +85,77 @@ def _bajar(url, destino):
                 f.write(parte)
 
 
-def cargar_avatar(avatar, base):
+def _bajar_o_nada(url, destino):
+    try:
+        _bajar(url, destino)
+        return True
+    except requests.HTTPError:
+        return False
+
+
+def cargar_avatar(avatar, base, t):
+    """Deja el avatar listo en memoria. Anota en t cuánto tardó cada paso."""
     if avatar in AVATARES:
-        return AVATARES[avatar], "memoria"
+        t["avatar_desde"] = "memoria"
+        return AVATARES[avatar]
+    AVATARES.clear()  # una sola a la vez en memoria (los cuadros pesan ~8 GB)
     d = os.path.join(CACHE, avatar)
-    origen = "disco"
+    t["avatar_desde"] = "disco"
     if not os.path.exists(os.path.join(d, "listo")):
-        origen = "R2"
+        t["avatar_desde"] = "R2"
         os.makedirs(d, exist_ok=True)
-        _bajar(f"{base}/clips/{avatar}.mp4", f"{d}/clip.mp4")
-        _bajar(f"{base}/preparados/{avatar}.tar.sha256", f"{d}/sha")
+        x = time.time()
+        # Todo se baja al mismo tiempo; las partes que no existen se ignoran.
+        with ThreadPoolExecutor(8) as pool:
+            clip = pool.submit(_bajar, f"{base}/clips/{avatar}.mp4", f"{d}/clip.mp4")
+            sha = pool.submit(_bajar, f"{base}/preparados/{avatar}.tar.sha256", f"{d}/sha")
+            partes = [pool.submit(_bajar_o_nada, f"{base}/preparados/{avatar}.tar.parte-{n:02d}", f"{d}/p{n:02d}") for n in range(6)]
+            clip.result(); sha.result()
+            hay = [k for k, f in enumerate(partes) if f.result()]
+        if not hay or hay != list(range(len(hay))):
+            raise RuntimeError(f"partes del avatar incompletas: {hay}")
+        t["avatar_bajar_s"] = round(time.time() - x, 1)
+        x = time.time()
+        h = hashlib.sha256()
         tar = f"{d}/a.tar"
         with open(tar, "wb") as salida:
-            for n in range(100):
-                try:
-                    _bajar(f"{base}/preparados/{avatar}.tar.parte-{n:02d}", f"{d}/p")
-                except requests.HTTPError:
-                    break
-                with open(f"{d}/p", "rb") as p:
-                    salida.write(p.read())
-        os.remove(f"{d}/p")
-        h = hashlib.sha256()
-        with open(tar, "rb") as f:
-            for b in iter(lambda: f.read(1 << 20), b""):
-                h.update(b)
+            for k in hay:
+                with open(f"{d}/p{k:02d}", "rb") as f:
+                    for b in iter(lambda: f.read(1 << 22), b""):
+                        h.update(b)
+                        salida.write(b)
+                os.remove(f"{d}/p{k:02d}")
         if h.hexdigest() != open(f"{d}/sha").read().split()[0]:
             raise RuntimeError("paquete del avatar corrupto")
-        with tarfile.open(tar) as t:
-            t.extractall(d)
+        with tarfile.open(tar) as tf:
+            tf.extractall(d)
         os.remove(tar)
-        # Cuadros del clip en un archivo plano (solo la ida; la vuelta se lee al revés).
-        cap = cv2.VideoCapture(f"{d}/clip.mp4")
-        ok, f0 = cap.read()
-        if not ok:
-            raise RuntimeError("no se pudo leer el clip")
-        h_, w_ = f0.shape[:2]
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) + 5
-        mm = np.lib.format.open_memmap(f"{d}/cuadros.npy", mode="w+", dtype=np.uint8, shape=(total, h_, w_, 3))
-        mm[0] = f0
-        n = 1
-        while True:
-            ok, f = cap.read()
-            if not ok:
-                break
-            if n >= total:
-                raise RuntimeError("el clip tiene más cuadros de los esperados")
-            mm[n] = f
-            n += 1
-        mm.flush()
-        del mm
-        open(f"{d}/n", "w").write(str(n))
         open(f"{d}/listo", "w").write("1")
+        t["avatar_extraer_s"] = round(time.time() - x, 1)
 
     a = os.path.join(d, avatar)
-    n = int(open(f"{d}/n").read())
-    cuadros = np.load(f"{d}/cuadros.npy", mmap_mode="r")
+    x = time.time()
+    # Los cuadros del clip van a memoria (solo la ida; la vuelta se lee al revés). Sin escribir a disco.
+    cap = cv2.VideoCapture(f"{d}/clip.mp4")
+    cuadros = []
+    while True:
+        ok, f = cap.read()
+        if not ok:
+            break
+        cuadros.append(f)
+    cap.release()
+    if not cuadros:
+        raise RuntimeError("no se pudo leer el clip")
+    n = len(cuadros)
+    t["avatar_decodificar_s"] = round(time.time() - x, 1)
+    x = time.time()
     latentes = torch.load(f"{a}/latents.pt", map_location="cpu")
     coords = pickle.load(open(f"{a}/coords.pkl", "rb"))
     caja_mascara = pickle.load(open(f"{a}/mask_coords.pkl", "rb"))
     archivos = sorted(glob.glob(f"{a}/mask/*.png"), key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
-    mascaras = [cv2.imread(x, cv2.IMREAD_GRAYSCALE) for x in archivos]
+    with ThreadPoolExecutor(HILOS) as pool:
+        mascaras = list(pool.map(lambda x: cv2.imread(x, cv2.IMREAD_GRAYSCALE), archivos))
+    t["avatar_mascaras_s"] = round(time.time() - x, 1)
     if not (len(coords) == len(caja_mascara) == len(mascaras) == 2 * n):
         raise RuntimeError(f"avatar incompleto: cuadros {n}, coords {len(coords)}, mascaras {len(mascaras)}")
     if len(latentes) != len(coords):
@@ -155,12 +167,11 @@ def cargar_avatar(avatar, base):
         "coords": coords,
         "cajas": caja_mascara,
         "mascaras": mascaras,
-        "alto": cuadros.shape[1],
-        "ancho": cuadros.shape[2],
+        "alto": cuadros[0].shape[0],
+        "ancho": cuadros[0].shape[1],
     }
-    AVATARES.clear()  # una sola a la vez en memoria
     AVATARES[avatar] = av
-    return av, origen
+    return av
 
 
 def cuadro_base(av, p):
@@ -197,13 +208,13 @@ def handler(job):
     trabajo = f"/tmp/trabajo-{job['id']}"
     os.makedirs(trabajo, exist_ok=True)
     try:
-        av, origen = cargar_avatar(e["avatar"], e["avatar_base"].rstrip("/"))
+        av = cargar_avatar(e["avatar"], e["avatar_base"].rstrip("/"), t)
         t["avatar_s"] = round(time.time() - t0, 1)
-        t["avatar_desde"] = origen
 
         t1 = time.time()
         audio = f"{trabajo}/audio"
         _bajar(e["audio_url"], audio)
+        t["audio_bajar_s"] = round(time.time() - t1, 1)
         feats, largo = audio_processor.get_audio_feature(audio, weight_dtype=torch.float16)
         trozos = audio_processor.get_whisper_chunk(feats, device, torch.float16, whisper, largo, fps=FPS,
                                                    audio_padding_length_left=2, audio_padding_length_right=2)
